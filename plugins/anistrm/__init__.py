@@ -18,7 +18,7 @@ class ANiStrm(_PluginBase):
     plugin_name = "ANiStrm"
     plugin_desc = "自动获取当季所有番剧，免去下载，轻松拥有一个番剧媒体库"
     plugin_icon = "https://raw.githubusercontent.com/honue/MoviePilot-Plugins/main/icons/anistrm.png"
-    plugin_version = "2.5.0"
+    plugin_version = "2.5.1"
     plugin_author = "honue"
     author_url = "https://github.com/honue"
     plugin_config_prefix = "anistrm_"
@@ -112,18 +112,18 @@ class ANiStrm(_PluginBase):
         total_failed = 0
 
         for season in seasons:
-            file_names = self._client.get_season_list(season)
-            season_total = len(file_names)
+            file_entries = self._client.get_season_entries(season)
+            season_total = len(file_entries)
             season_created = 0
             season_exists = 0
             season_failed = 0
             logger.info(f"ANi-Strm开始处理季度：{season}，文件数={season_total}")
-            for file_name in file_names:
+            for file_entry in file_entries:
                 status = self._strm_service.touch_strm_file(
                     storage_path=self._storageplace,
-                    file_name=file_name,
-                    season=season,
-                    base_url=self._client._get_openani_base(),
+                    file_name=file_entry["name"],
+                    file_url=file_entry["url"],
+                    relative_dir=file_entry.get("relative_dir"),
                 )
                 if status == "created":
                     season_created += 1
@@ -397,6 +397,8 @@ class ANiStrm(_PluginBase):
 
 
 class AniStrmClient:
+    FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+
     def __init__(self, request_factory=None, proxy_base: Optional[str] = None, use_proxy: bool = False):
         self._request_factory = request_factory or self._build_request_utils
         self._proxy_base = self.normalize_proxy_base(proxy_base)
@@ -428,10 +430,12 @@ class AniStrmClient:
         return self.get_season_list(season)
 
     def get_season_list(self, season: str) -> List[str]:
+        entries = self.get_season_entries(season)
+        return [entry["name"] for entry in entries if entry.get("name")]
+
+    def get_season_entries(self, season: str) -> List[Dict[str, str]]:
         def operation():
-            payload = self._fetch_folder_payload(f"{self._get_openani_base()}/{season}/")
-            files = payload.get("files") or []
-            return [file_info["name"] for file_info in files if file_info.get("name")]
+            return self._collect_folder_entries(f"{season}/")
 
         return self._with_retry(operation, default=[])
 
@@ -452,7 +456,7 @@ class AniStrmClient:
             for file_info in payload.get("files") or []:
                 name = file_info.get("name") or ""
                 mime_type = file_info.get("mimeType") or ""
-                if mime_type != "application/vnd.google-apps.folder":
+                if mime_type != self.FOLDER_MIME_TYPE:
                     continue
                 parts = name.split("-", 1)
                 if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
@@ -482,6 +486,31 @@ class AniStrmClient:
             ua=settings.USER_AGENT if settings.USER_AGENT else None,
             proxies=settings.PROXY if self._use_proxy and settings.PROXY else None,
         )
+
+    def _collect_folder_entries(self, folder_path: str, relative_dir: str = "") -> List[Dict[str, str]]:
+        payload = self._fetch_folder_payload(f"{self._get_openani_base()}/{folder_path}")
+        entries: List[Dict[str, str]] = []
+        for file_info in payload.get("files") or []:
+            name = file_info.get("name") or ""
+            if not name:
+                continue
+            mime_type = file_info.get("mimeType") or ""
+            if mime_type == self.FOLDER_MIME_TYPE:
+                child_relative_dir = f"{relative_dir}/{name}".strip("/")
+                child_folder_path = f"{folder_path.rstrip('/')}/{quote(name, safe='')}/"
+                entries.extend(self._collect_folder_entries(child_folder_path, child_relative_dir))
+                continue
+
+            encoded_name = quote(name, safe="")
+            file_url = f"{self._get_openani_base()}/{folder_path.rstrip('/')}/{encoded_name}"
+            entries.append(
+                {
+                    "name": name,
+                    "url": file_url,
+                    "relative_dir": relative_dir,
+                }
+            )
+        return entries
 
     @staticmethod
     def normalize_proxy_base(proxy_base: Optional[str]) -> str:
@@ -532,7 +561,7 @@ class AniStrmClient:
         for file_info in files:
             name = file_info.get("name") or ""
             mime_type = file_info.get("mimeType") or ""
-            if mime_type != "application/vnd.google-apps.folder":
+            if mime_type != AniStrmClient.FOLDER_MIME_TYPE:
                 continue
             parts = name.split("-", 1)
             if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
@@ -569,6 +598,7 @@ class StrmFileService:
         season: Optional[str] = None,
         file_url: Optional[str] = None,
         base_url: str = "https://openani.an-i.workers.dev",
+        relative_dir: Optional[str] = None,
     ) -> str:
         if not storage_path:
             logger.error("创建strm源文件失败：未配置存储目录")
@@ -583,6 +613,8 @@ class StrmFileService:
             src_url = self.build_season_url(season, file_name, base_url=base_url)
 
         directory = Path(storage_path)
+        if relative_dir:
+            directory = directory / relative_dir
         file_path = directory / f"{file_name}.strm"
         if file_path.exists():
             logger.debug(f"ANi-Strm跳过已存在文件：{file_path.name}")
